@@ -1,0 +1,46 @@
+# Virtual environment
+venv/
+
+# Downloaded SEC filings (large — regenerate with download scripts)
+filings/
+filings_8k/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated output CSVs and data files
+CEO_*.csv
+8k_results*.csv
+8k_manifest.csv
+8k_progress.csv
+efts_progress.csv
+manifest.csv
+proxy_progress.csv
+extract_progress.csv
+query_context.csv
+ceo_comp_results.csv
+ceo_compensation_by_ticker_year.csv
+ceo_compensation_extraction_failures.csv
+ceo_history_wide_format.csv
+not_found_*.csv
+Summary_of_Blanks.csv
+format.csv
+tickers.csv
+ceo_database.csv
+
+# Databases
+*.db
+
+# QA reports
+qa_reports/
+
+# Source data (not code — keep locally, don't commit)
+ceorater_airtable_db_02232026.csv
+debug.py
+
+# IDE / OS
+.env
+.DS_Store
+*.swp
