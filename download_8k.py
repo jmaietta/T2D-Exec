@@ -38,7 +38,7 @@ from urllib.parse import urlencode
 import requests
 
 from edgar_client import (
-    build_session, fetch, get_cik_map,
+    build_session, fetch, get_ciks,
     SEC_SUBMISSIONS_URL, SEC_SUBMISSIONS_OLD, SEC_ARCHIVES_BASE, EFTS_SEARCH_URL,
 )
 
@@ -49,6 +49,7 @@ FILINGS_DIR   = "./filings_8k"
 MANIFEST_CSV  = "./8k_manifest.csv"
 WINDOW_BEFORE = 90     # days before the reference date to search
 WINDOW_AFTER  = 40     # days after the reference date to search
+RECENT_SWEEP_DAYS = 548  # ~18 months for current-CEO supersession detection
 
 
 # ── Date helpers ──────────────────────────────────────────────────────────────
@@ -198,6 +199,62 @@ def find_502_in_window(
     return sec_name, hits
 
 
+def find_recent_502(
+    session: requests.Session,
+    cik: str,
+    days_back: int = RECENT_SWEEP_DAYS,
+) -> tuple[str, list[dict]]:
+    """Find recent Item 5.02 8-Ks for current-CEO transition detection."""
+    cik_padded = cik.zfill(10)
+    cutoff = date_cls.today() - timedelta(days=days_back)
+    try:
+        data = fetch(session, SEC_SUBMISSIONS_URL.format(cik_padded=cik_padded)).json()
+    except Exception as e:
+        print(f"    submissions fetch error (recent sweep): {e}")
+        return "", []
+
+    sec_name: str = data.get("name", "")
+    hits: list[dict] = []
+
+    def _scan_block(filings_block: dict) -> bool:
+        forms = filings_block.get("form", [])
+        accs = filings_block.get("accessionNumber", [])
+        dates = filings_block.get("filingDate", [])
+        docs = filings_block.get("primaryDocument", [])
+        items = filings_block.get("items", [])
+        for form, acc, filing_date, doc, item in zip(forms, accs, dates, docs, items):
+            try:
+                fd = date_cls.fromisoformat(filing_date)
+            except ValueError:
+                continue
+            if fd < cutoff:
+                return True
+            if form in ("8-K", "8-K/A") and "5.02" in (item or ""):
+                acc_nodash = acc.replace("-", "")
+                hits.append({
+                    "accession": acc,
+                    "filing_date": filing_date,
+                    "items": item,
+                    "doc_url": f"{SEC_ARCHIVES_BASE}/edgar/data/{cik}/{acc_nodash}/{doc}",
+                    "search_mode": "recent_sweep",
+                })
+        return False
+
+    if not _scan_block(data.get("filings", {}).get("recent", {})):
+        for file_entry in data.get("files", []):
+            try:
+                older = fetch(
+                    session,
+                    SEC_SUBMISSIONS_OLD.format(filename=file_entry["name"])
+                ).json()
+                if _scan_block(older):
+                    break
+            except Exception:
+                pass
+
+    return sec_name, hits
+
+
 def efts_search_appointment(
     session: requests.Session,
     ceo_name: str,
@@ -314,6 +371,7 @@ def download_filing(session: requests.Session, ticker: str, filing: dict) -> dic
 
 MANIFEST_FIELDS = [
     "ticker", "company_name", "ceo_name_proxy", "start_date_proxy",
+    "search_mode",
     "filing_date", "accession", "items", "doc_url",
     "local_path", "status", "file_size_kb", "error",
 ]
@@ -362,7 +420,7 @@ def run(context_csv: str, tickers: list[str]) -> None:
     print(f"Processing {len(companies)} ticker(s): {', '.join(sorted(companies))}\n")
 
     session = build_session()
-    cik_map = get_cik_map(session)
+    cik_map = get_ciks(session, tickers)
 
     Path(FILINGS_DIR).mkdir(exist_ok=True)
 
@@ -387,6 +445,8 @@ def run(context_csv: str, tickers: list[str]) -> None:
               f"Searching {window_desc}")
 
         sec_name, filings = find_502_in_window(session, cik, center)
+        for filing in filings:
+            filing.setdefault("search_mode", "start_window")
         if sec_name and not company["company_name"]:
             company["company_name"] = sec_name
 
@@ -394,6 +454,19 @@ def run(context_csv: str, tickers: list[str]) -> None:
             filings = efts_search_appointment(session, company["ceo_name"], cik, center)
             if filings:
                 print("           no 5.02 filings in submissions window; using historical EFTS fallback")
+                for filing in filings:
+                    filing.setdefault("search_mode", "historical_efts")
+
+        # Always sweep recent 5.02 filings to detect post-proxy CEO transitions.
+        rec_name, recent_filings = find_recent_502(session, cik, days_back=RECENT_SWEEP_DAYS)
+        if rec_name and not company["company_name"]:
+            company["company_name"] = rec_name
+        if recent_filings:
+            print(f"           + {len(recent_filings)} recent Item 5.02 filing(s) from last ~18 months")
+            by_acc = {f["accession"]: f for f in filings}
+            for rf in recent_filings:
+                by_acc.setdefault(rf["accession"], rf)
+            filings = sorted(by_acc.values(), key=lambda r: r["filing_date"])
 
         if not filings:
             print(f"           NO Item 5.02 8-Ks found in window")
@@ -407,6 +480,7 @@ def run(context_csv: str, tickers: list[str]) -> None:
                 "company_name":        company["company_name"],
                 "ceo_name_proxy":      company["ceo_name"],
                 "start_date_proxy":    company["start_date"],
+                "search_mode":         filing.get("search_mode", "start_window"),
                 **row,
             })
             status = row["status"]

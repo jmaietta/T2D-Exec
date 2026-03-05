@@ -20,15 +20,17 @@ from pathlib import Path
 
 import anthropic
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
-from dotenv import load_dotenv
+from env_utils import load_local_env
+from sec_filing_parser import parse_filing, extract_ixbrl_peo_total_comp
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
+load_local_env(Path(__file__).parent / ".env", override=True)
 
 MANIFEST_CSV   = "./manifest.csv"
 RESULTS_CSV    = "./ceo_comp_results.csv"
 PROGRESS_CSV   = "./extract_progress.csv"
+LLM_CACHE_DIR  = Path(__file__).parent / ".cache" / "llm_extract"
 MODEL          = "claude-sonnet-4-6"
 MAX_TOKENS     = 1500
 API_DELAY      = 3.0
@@ -66,6 +68,15 @@ def load_progress():
             for row in csv.DictReader(f):
                 done.add(f"{row['ticker']}|{row['comp_year']}|{row['accession']}")
     return done
+
+
+def load_existing_result_keys():
+    keys = set()
+    if Path(RESULTS_CSV).exists():
+        with open(RESULTS_CSV, encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                keys.add(f"{row.get('ticker', '')}|{row.get('accession', '')}")
+    return keys
 
 
 def mark_progress(ticker, comp_year, accession):
@@ -155,6 +166,12 @@ def extract_text(html):
     return full_text[mid: mid + MAX_TEXT_CHARS]
 
 
+def llm_cache_path(ticker: str, accession: str) -> Path:
+    LLM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    safe = accession.replace("/", "_")
+    return LLM_CACHE_DIR / f"{ticker}_{safe}.json"
+
+
 PROMPT = """You are analyzing a proxy statement (DEF 14A) for {ticker}. Filed: {filing_date}
 
 The data below is a tab-separated rendering of the Summary Compensation Table.
@@ -179,7 +196,15 @@ Proxy table data:
 {proxy_text}"""
 
 
-def call_claude(client, ticker, filing_date, proxy_text):
+def call_claude(client, ticker, filing_date, proxy_text, accession=""):
+    cache_path = llm_cache_path(ticker, accession) if accession else None
+    if cache_path and cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(cached, list):
+                return cached
+        except Exception:
+            pass
     time.sleep(API_DELAY)
     try:
         msg = client.messages.create(
@@ -195,6 +220,8 @@ def call_claude(client, ticker, filing_date, proxy_text):
         try:
             result = json.loads(raw)
             if isinstance(result, list):
+                if cache_path:
+                    cache_path.write_text(json.dumps(result), encoding="utf-8")
                 return result
         except json.JSONDecodeError:
             pass
@@ -202,6 +229,8 @@ def call_claude(client, ticker, filing_date, proxy_text):
         if match:
             result = json.loads(match.group())
             if isinstance(result, list):
+                if cache_path:
+                    cache_path.write_text(json.dumps(result), encoding="utf-8")
                 return result
         print(f"    Could not parse: {raw[:150]}")
         return []
@@ -213,15 +242,16 @@ def call_claude(client, ticker, filing_date, proxy_text):
 def run(ticker_filter=None, force=False):
     """ticker_filter: list of tickers, or None for all."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("ERROR: ANTHROPIC_API_KEY not set — check your .env file")
-        raise SystemExit(1)
-
-    client   = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key) if api_key else None
     manifest = load_manifest(ticker_filter)
-    done     = set() if force else load_progress()
-    pending  = [f for f in manifest
-                if force or f"{f['ticker']}|{f['comp_year']}|{f['accession']}" not in done]
+    done = set() if force else load_progress()
+    existing_result_keys = set() if force else load_existing_result_keys()
+    pending = []
+    for filing in manifest:
+        progress_key = f"{filing['ticker']}|{filing['comp_year']}|{filing['accession']}"
+        result_key = f"{filing['ticker']}|{filing['accession']}"
+        if force or progress_key not in done or result_key not in existing_result_keys:
+            pending.append(filing)
 
     print(f"Pending : {len(pending)}")
     print(f"Skipping: {len(manifest) - len(pending)} already done\n")
@@ -250,7 +280,29 @@ def run(ticker_filter=None, force=False):
                 print(f"read error: {e}")
                 continue
 
-            extracted = call_claude(client, ticker, filing["filing_date"], extract_text(html))
+            parsed = parse_filing(
+                html, accession=filing["accession"], source_path=filing["local_path"]
+            )
+            structured_rows = extract_ixbrl_peo_total_comp(parsed)
+            extracted = []
+            if structured_rows:
+                for row in structured_rows:
+                    extracted.append({
+                        "name": "",
+                        "title": "Chief Executive Officer",
+                        "fiscal_year": row["fiscal_year"],
+                        "total_comp": row["total_comp"],
+                        "partial_year": False,
+                        "notes": row["source"],
+                    })
+            else:
+                if client is None:
+                    print(f"no structured comp found and ANTHROPIC_API_KEY is not set")
+                    total_failed += 1
+                    continue
+                extracted = call_claude(
+                    client, ticker, filing["filing_date"], extract_text(html), accession=filing["accession"]
+                )
             rows_written = 0
 
             for row in extracted:
@@ -273,10 +325,11 @@ def run(ticker_filter=None, force=False):
             mark_progress(ticker, comp_year, filing["accession"])
 
             if rows_written:
-                print(f"{rows_written} row(s)")
+                source = "ixbrl_fact" if structured_rows else "llm"
+                print(f"{rows_written} row(s) [{parsed['parser_mode']}:{parsed.get('fact_source','') or source}]")
                 total_rows += rows_written
             else:
-                print("no CEO found")
+                print(f"no CEO found [{parsed['parser_mode']}:llm]")
                 total_failed += 1
 
     print(f"\n{'─'*50}")

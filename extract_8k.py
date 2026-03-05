@@ -27,16 +27,16 @@ from urllib.parse import urlencode
 
 import anthropic
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
-from dotenv import load_dotenv
 import warnings
+from env_utils import load_local_env
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
+load_local_env(Path(__file__).parent / ".env", override=True)
 
 import requests
 
-from edgar_client import build_session, fetch, get_cik_map, SEC_ARCHIVES_BASE, EFTS_SEARCH_URL
+from edgar_client import build_session, fetch, get_ciks, SEC_ARCHIVES_BASE, EFTS_SEARCH_URL
 from db import parse_date
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -67,7 +67,10 @@ MAX_TEXT_CHARS      = 6000
 # Locate the CEO appointment section in 8-K text
 ITEM_502_RE = re.compile(r"item\s+5\.02", re.I)
 CEO_TITLE_RE = re.compile(
-    r"chief\s+executive\s+officer|chief\s+executive|\bCEO\b|principal\s+executive\s+officer",
+    r"chief\s+executive\s+officer|chief\s+executive|\bCEO\b|"
+    r"principal\s+executive\s+officer|"
+    r"president\s*(?:and|&)\s*chief\s+executive\s+officer|"
+    r"president\s*(?:and|&)\s*ceo",
     re.I,
 )
 
@@ -85,6 +88,10 @@ The executive title may appear as any of:
   - Chief Executive
   - CEO
   - Principal Executive Officer
+  - President and Chief Executive Officer
+  - President & Chief Executive Officer
+  - President and CEO
+  - President & CEO
 
 RULES:
 1. "found" must be true ONLY if this filing explicitly announces, reports, or \
@@ -434,13 +441,14 @@ def mark_proxy_progress(ticker: str, accession: str) -> None:
 
 # ── Manifest ──────────────────────────────────────────────────────────────────
 
-def load_manifest(tickers: list[str]) -> dict[str, list[dict]]:
+def load_manifest(tickers: list[str], context_csv: str = CONTEXT_CSV) -> dict[str, list[dict]]:
     """Load 8k_manifest.csv rows for the requested tickers, grouped by ticker."""
     if not Path(MANIFEST_CSV).exists():
         print(f"ERROR: {MANIFEST_CSV} not found. Run download_8k.py first.")
         raise SystemExit(1)
 
     want = {t.upper() for t in tickers}
+    current_context = load_context(context_csv)
     by_ticker: dict[str, list[dict]] = {}
 
     with open(MANIFEST_CSV, encoding="utf-8-sig", newline="") as f:
@@ -451,6 +459,10 @@ def load_manifest(tickers: list[str]) -> dict[str, list[dict]]:
             if row["status"] not in ("downloaded", "exists"):
                 continue
             if not Path(row["local_path"]).exists():
+                continue
+            current_hint = current_context.get(t, {}).get("start_date", "")
+            row_hint = (row.get("start_date_proxy") or row.get("start_date_airtable") or "").strip()
+            if current_hint and row_hint != current_hint:
                 continue
             by_ticker.setdefault(t, []).append(row)
 
@@ -558,6 +570,13 @@ def compare_dates(proxy_str: str | None, sec_str: str | None) -> tuple[str, str]
     return status, str(diff)
 
 
+def _candidate_sort_date(candidate: dict) -> date_cls | None:
+    d = parse_date(candidate.get("start_date_8k", ""))
+    if d is not None:
+        return d
+    return parse_date(candidate.get("filing_date_8k", ""))
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 # ── Name matching ─────────────────────────────────────────────────────────────
@@ -638,7 +657,7 @@ def run(tickers: list[str], force: bool = False, context_csv: str = CONTEXT_CSV)
         raise SystemExit(1)
 
     client          = anthropic.Anthropic(api_key=api_key)
-    by_ticker       = load_manifest(tickers)
+    by_ticker       = load_manifest(tickers, context_csv=context_csv)
     done            = set() if force else load_progress()
     proxy_done      = set() if force else load_proxy_progress()
     proxy_by_ticker = load_proxy_manifest()
@@ -678,6 +697,7 @@ def run(tickers: list[str], force: bool = False, context_csv: str = CONTEXT_CSV)
         "exact_match": "✓ EXACT", "month_match": "~ MONTH",
         "year_match": "≈ YEAR",   "mismatch": "✗ MISMATCH",
         "not_found": "? NOT FOUND", "no_proxy_date": "NEW",
+        "current_ceo_changed": "↻ CEO CHANGED",
     }
 
     for i, ticker in enumerate(sorted(by_ticker), 1):
@@ -690,7 +710,8 @@ def run(tickers: list[str], force: bool = False, context_csv: str = CONTEXT_CSV)
         print(f"\n[{i}/{len(by_ticker)}] {ticker}  |  {ceo_proxy or '?'}  "
               f"|  {len(filings)} 8-K(s) to check")
 
-        best: dict | None = None   # filing where Claude confirmed this CEO
+        best: dict | None = None   # filing where Claude confirmed proxy CEO
+        best_recent_change: dict | None = None  # filing where Claude found a different recent CEO appointment
         all_notes: list[str] = []
         all_skipped = True  # track whether every filing was skipped
 
@@ -699,7 +720,11 @@ def run(tickers: list[str], force: bool = False, context_csv: str = CONTEXT_CSV)
             filing_date = filing["filing_date"]
             key         = f"{ticker}|{accession}"
 
-            if key in done and ticker not in retry_tickers:
+            if (
+                key in done
+                and ticker not in retry_tickers
+                and filing.get("search_mode") != "recent_sweep"
+            ):
                 print(f"  {filing_date}  [skipped — already processed]")
                 continue
 
@@ -714,19 +739,25 @@ def run(tickers: list[str], force: bool = False, context_csv: str = CONTEXT_CSV)
                 mark_progress(ticker, accession)
                 continue
 
-            text   = extract_8k_text(html)
-            result = call_claude(client, ticker, company, ceo_proxy,
-                                 filing_date, text)
-            if not has_api_error(result):
+            text = extract_8k_text(html)
+            result = call_claude(client, ticker, company, ceo_proxy, filing_date, text)
+            secondary_result = None
+            if filing.get("search_mode") == "recent_sweep":
+                secondary_result = call_claude(client, ticker, company, "", filing_date, text)
+
+            if (not has_api_error(result)) and (
+                secondary_result is None or not has_api_error(secondary_result)
+            ):
                 mark_progress(ticker, accession)
 
-            found          = result.get("found", False)
-            ceo_8k         = (result.get("ceo_name") or "").strip()
+            found = result.get("found", False)
+            ceo_8k = (result.get("ceo_name") or "").strip()
             effective_date = (result.get("effective_date") or "").strip()
-            notes          = (result.get("notes") or "").strip()
+            notes = (result.get("notes") or "").strip()
 
             icon = "✓" if found else "–"
-            print(f"  {filing_date}  {icon}  "
+            mode = filing.get("search_mode", "start_window")
+            print(f"  {filing_date}  {icon} [{mode}]  "
                   f"name={ceo_8k or '-':30s}  "
                   f"date={effective_date or '-':12s}  "
                   f"{notes[:50] if notes else ''}")
@@ -738,27 +769,57 @@ def run(tickers: list[str], force: bool = False, context_csv: str = CONTEXT_CSV)
                 is_interim = result.get("interim", False)
                 if names_match(ceo_proxy, ceo_8k):
                     candidate = {
-                        "ceo_name_8k":    ceo_8k,
-                        "start_date_8k":  effective_date,
+                        "ceo_name_8k": ceo_8k,
+                        "start_date_8k": effective_date,
                         "filing_date_8k": filing_date,
-                        "accession_8k":   accession,
-                        "interim":        is_interim,
+                        "accession_8k": accession,
+                        "interim": is_interim,
                     }
                     if best is None:
                         best = candidate
                     elif best.get("interim") and not is_interim:
                         best = candidate  # upgrade from interim to permanent
                     elif not best.get("interim") and not is_interim:
-                        # Both permanent — prefer the one closest to the hint date
-                        # If no reference date, prefer the most recent appointment
-                        d_at   = parse_date(date_proxy)
+                        d_at = parse_date(date_proxy)
                         d_best = parse_date(best["start_date_8k"])
                         d_cand = parse_date(candidate["start_date_8k"])
                         if d_at and d_best and d_cand:
                             if abs((d_cand - d_at).days) < abs((d_best - d_at).days):
                                 best = candidate
-                        elif not d_at and d_best and d_cand and d_cand > d_best:
-                            best = candidate  # no ref date → prefer most recent
+                        elif not d_at:
+                            c_best = _candidate_sort_date(best)
+                            c_cand = _candidate_sort_date(candidate)
+                            if c_best is None or (c_cand is not None and c_cand > c_best):
+                                best = candidate
+
+            if secondary_result:
+                found2 = secondary_result.get("found", False)
+                ceo2 = (secondary_result.get("ceo_name") or "").strip()
+                date2 = (secondary_result.get("effective_date") or "").strip()
+                notes2 = (secondary_result.get("notes") or "").strip()
+                icon2 = "✓" if found2 else "–"
+                print(f"               {icon2} [recent-any-ceo]  "
+                      f"name={ceo2 or '-':30s}  "
+                      f"date={date2 or '-':12s}  "
+                      f"{notes2[:50] if notes2 else ''}")
+                if notes2:
+                    all_notes.append(f"{filing_date} [recent-any-ceo]: {notes2}")
+
+                if found2 and ceo2:
+                    c2 = {
+                        "ceo_name_8k": ceo2,
+                        "start_date_8k": date2,
+                        "filing_date_8k": filing_date,
+                        "accession_8k": accession,
+                        "interim": secondary_result.get("interim", False),
+                    }
+                    if best_recent_change is None:
+                        best_recent_change = c2
+                    else:
+                        prev = _candidate_sort_date(best_recent_change)
+                        cur = _candidate_sort_date(c2)
+                        if prev is None or (cur is not None and cur > prev):
+                            best_recent_change = c2
 
         # If every filing was already processed, restore the previous result row
         if all_skipped:
@@ -777,19 +838,24 @@ def run(tickers: list[str], force: bool = False, context_csv: str = CONTEXT_CSV)
             continue
 
         # Determine match status
-        if best:
-            match_status, days_diff = compare_dates(
-                date_proxy, best["start_date_8k"]
-            )
+        chosen = best
+        match_status = "not_found"
+        days_diff = ""
+        if best_recent_change and best_recent_change.get("ceo_name_8k") and (
+            not ceo_proxy or not names_match(ceo_proxy, best_recent_change["ceo_name_8k"])
+        ):
+            chosen = best_recent_change
+            match_status = "current_ceo_changed"
+        elif best:
+            match_status, days_diff = compare_dates(date_proxy, best["start_date_8k"])
         else:
-            match_status, days_diff = "not_found", ""
-            best = {"ceo_name_8k": "", "start_date_8k": "",
-                    "filing_date_8k": "", "accession_8k": ""}
+            chosen = {"ceo_name_8k": "", "start_date_8k": "",
+                      "filing_date_8k": "", "accession_8k": ""}
 
         counts[match_status] = counts.get(match_status, 0) + 1
 
         print(f"  → {STATUS_ICON.get(match_status, match_status)}"
-              f"  date={best['start_date_8k'] or '-'}"
+              f"  date={chosen['start_date_8k'] or '-'}"
               f"  diff={days_diff + 'd' if days_diff else 'n/a'}")
 
         new_results.append({
@@ -797,10 +863,10 @@ def run(tickers: list[str], force: bool = False, context_csv: str = CONTEXT_CSV)
             "company_name":        company,
             "ceo_name_proxy":      ceo_proxy,
             "start_date_proxy":    date_proxy,
-            "ceo_name_8k":         best["ceo_name_8k"],
-            "start_date_8k":       best["start_date_8k"],
-            "filing_date_8k":      best["filing_date_8k"],
-            "accession_8k":        best["accession_8k"],
+            "ceo_name_8k":         chosen["ceo_name_8k"],
+            "start_date_8k":       chosen["start_date_8k"],
+            "filing_date_8k":      chosen["filing_date_8k"],
+            "accession_8k":        chosen["accession_8k"],
             "match_status":        match_status,
             "days_diff":           days_diff,
             "notes":               " | ".join(all_notes)[:500],
@@ -950,7 +1016,8 @@ def run(tickers: list[str], force: bool = False, context_csv: str = CONTEXT_CSV)
 
     _LABEL = {"exact_match": "confirmed", "month_match": "month match",
               "year_match": "year match", "mismatch": "mismatch",
-              "not_found": "not found", "no_proxy_date": "new"}
+              "not_found": "not found", "no_proxy_date": "new",
+              "current_ceo_changed": "current ceo changed"}
     if proxy_counts:
         print(f"\nProxy fallback results:")
         for status, count in sorted(proxy_counts.items()):
@@ -978,7 +1045,7 @@ def run(tickers: list[str], force: bool = False, context_csv: str = CONTEXT_CSV)
         print(f"\n{'─'*55}")
         print(f"Phase 3 — EFTS full-text search: {len(efts_needed)} ticker(s)")
         http_session = build_session()
-        cik_map      = get_cik_map(http_session)
+        cik_map      = get_ciks(http_session, retry_tickers)
         efts_done    = set() if force else load_efts_progress()
 
         for ticker in efts_needed:

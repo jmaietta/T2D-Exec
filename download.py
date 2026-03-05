@@ -5,8 +5,10 @@ download.py - Phase 1: Download DEF 14A Proxy Filings
 Downloads DEF 14A filings for every ticker in query_context.csv.
 Files saved to: filings/{TICKER}/{comp_year}_DEF14A_{filing_date}.html
 
-Comp year = filing year - 1
-  e.g. proxy filed 2025-01-10 covers comp year 2024
+Comp year is inferred from the proxy text when possible.
+Fallback: filing year - 1
+  e.g. proxy filed 2025-01-10 often covers comp year 2024,
+  but off-calendar fiscal years can still be comp year 2025.
 
 Outputs:
   filings/{TICKER}/*.html   one file per proxy
@@ -21,10 +23,11 @@ Usage:
 
 import argparse
 import csv
+import re
 from pathlib import Path
 
 from edgar_client import (
-    build_session, fetch, get_cik_map,
+    build_session, fetch, get_ciks,
     SEC_SUBMISSIONS_URL, SEC_SUBMISSIONS_OLD, SEC_ARCHIVES_BASE,
 )
 
@@ -105,14 +108,65 @@ def get_def14a_filings(session, cik: str, max_filings: int = FILINGS_TO_PULL) ->
     return results
 
 
+def infer_comp_year(html: str, filing_date: str) -> int:
+    """Infer the compensation fiscal year from the proxy text.
+
+    Most proxies cover the prior calendar year, but companies with non-December
+    fiscal year ends often report a fiscal year equal to the filing year.
+    """
+    try:
+        filing_year = int(filing_date[:4])
+    except (TypeError, ValueError):
+        filing_year = 0
+
+    fallback = filing_year - 1 if filing_year else 0
+    if not html:
+        return fallback
+
+    # Cover-page fiscal year references usually appear near the top of the file.
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    head = text[:20000]
+
+    patterns = [
+        r"\bfiscal\s+year\s+ended\s+[A-Za-z]+\s+\d{1,2},\s+(20\d{2})\b",
+        r"\bfiscal\s+year\s+ended\s+[A-Za-z]+\s+(20\d{2})\b",
+        r"\bfor\s+fiscal\s+(20\d{2})\b",
+        r"\bfiscal\s+year\s+(20\d{2})\b",
+        r"\bfiscal\s+(20\d{2})\b",
+        r"\b(20\d{2})\s+proxy\s+statement\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, head, re.IGNORECASE)
+        if not match:
+            continue
+        year = int(match.group(1))
+        if filing_year and year not in (filing_year - 1, filing_year):
+            continue
+        return year
+
+    return fallback
+
+
+def existing_filing_path(ticker_dir: Path, filing_date: str) -> Path | None:
+    matches = sorted(ticker_dir.glob(f"*_DEF14A_{filing_date}.html"))
+    for path in matches:
+        try:
+            if path.stat().st_size > 1000:
+                return path
+        except OSError:
+            continue
+    return None
+
+
 # ── Download ──────────────────────────────────────────────────────────────────
 
 def download_filing(session, ticker: str, filing: dict) -> dict:
     ticker_dir = Path(FILINGS_DIR) / ticker
     ticker_dir.mkdir(parents=True, exist_ok=True)
-
-    filename = f"{filing['comp_year']}_DEF14A_{filing['filing_date']}.html"
-    filepath = ticker_dir / filename
+    filepath = existing_filing_path(ticker_dir, filing["filing_date"])
 
     row = {
         "ticker":       ticker,
@@ -120,20 +174,27 @@ def download_filing(session, ticker: str, filing: dict) -> dict:
         "filing_date":  filing["filing_date"],
         "accession":    filing["accession"],
         "doc_url":      filing["doc_url"],
-        "local_path":   str(filepath),
+        "local_path":   str(filepath) if filepath else "",
         "status":       "",
         "file_size_kb": "",
         "error":        "",
     }
 
-    if filepath.exists() and filepath.stat().st_size > 1000:
+    if filepath:
+        html = filepath.read_text(encoding="utf-8", errors="replace")
+        row["comp_year"] = infer_comp_year(html, filing["filing_date"])
+        row["local_path"] = str(filepath)
         row["status"] = "exists"
         row["file_size_kb"] = round(filepath.stat().st_size / 1024, 1)
         return row
 
     try:
         resp = fetch(session, filing["doc_url"])
+        row["comp_year"] = infer_comp_year(resp.text, filing["filing_date"])
+        filename = f"{row['comp_year']}_DEF14A_{filing['filing_date']}.html"
+        filepath = ticker_dir / filename
         filepath.write_text(resp.text, encoding="utf-8")
+        row["local_path"] = str(filepath)
         row["status"] = "downloaded"
         row["file_size_kb"] = round(filepath.stat().st_size / 1024, 1)
     except Exception as e:
@@ -148,6 +209,11 @@ def download_filing(session, ticker: str, filing: dict) -> dict:
 def write_manifest(rows: list[dict]) -> None:
     fields = ["ticker", "comp_year", "filing_date", "accession",
               "doc_url", "local_path", "status", "file_size_kb", "error"]
+    if not rows and Path(MANIFEST_CSV).exists():
+        with open(MANIFEST_CSV, encoding="utf-8-sig", newline="") as f:
+            existing = list(csv.DictReader(f))
+        print(f"\nManifest unchanged: {MANIFEST_CSV} ({len(existing)} rows)")
+        return
     with open(MANIFEST_CSV, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -163,7 +229,7 @@ def run(tickers: list[str] | None = None):
     print(f"Processing {len(tickers)} ticker(s)")
 
     session = build_session()
-    cik_map = get_cik_map(session)
+    cik_map = get_ciks(session, tickers)
 
     Path(FILINGS_DIR).mkdir(exist_ok=True)
 
@@ -196,13 +262,13 @@ def run(tickers: list[str] | None = None):
             manifest_rows.append(row)
             if row["status"] == "downloaded":
                 downloaded += 1
-                summary.append(f"{filing['comp_year']}✓")
+                summary.append(f"{row['comp_year']}✓")
             elif row["status"] == "exists":
                 skipped += 1
-                summary.append(f"{filing['comp_year']}~")
+                summary.append(f"{row['comp_year']}~")
             else:
                 failed += 1
-                summary.append(f"{filing['comp_year']}✗")
+                summary.append(f"{row['comp_year']}✗")
 
         print(f"[{i:3d}/{len(tickers)}] {ticker:<6}  {' '.join(summary)}")
 

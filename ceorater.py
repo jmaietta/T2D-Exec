@@ -11,7 +11,10 @@ Usage:
 
 import argparse
 import csv
+import os
+import re
 import subprocess
+import sys
 from collections import Counter
 from datetime import date
 from pathlib import Path
@@ -21,10 +24,17 @@ from db import read_db as _read_db, write_db as _write_db
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 PROXY_DIR        = Path(__file__).parent
-PYTHON           = str(PROXY_DIR / "venv" / "bin" / "python3")
+DOT_VENV_PYTHON  = PROXY_DIR / ".venv" / "bin" / "python3"
+VENV_PYTHON      = PROXY_DIR / "venv" / "bin" / "python3"
+PYTHON           = str(
+    DOT_VENV_PYTHON if DOT_VENV_PYTHON.exists()
+    else VENV_PYTHON if VENV_PYTHON.exists()
+    else Path(sys.executable)
+)
 CONTEXT_CSV      = str(PROXY_DIR / "query_context.csv")
 RESULTS_CSV      = str(PROXY_DIR / "8k_results.csv")
 MANIFEST_8K_CSV  = str(PROXY_DIR / "8k_manifest.csv")
+PROXY_MANIFEST_CSV = str(PROXY_DIR / "manifest.csv")
 
 
 # ── Internal database helpers ─────────────────────────────────────────────────
@@ -66,6 +76,21 @@ def read_manifest_companies() -> dict[str, str]:
     return companies
 
 
+def read_proxy_manifest_comp_years() -> dict[tuple[str, str], str]:
+    """Return {(TICKER, ACCESSION): comp_year} from the current proxy manifest."""
+    if not Path(PROXY_MANIFEST_CSV).exists():
+        return {}
+    years: dict[tuple[str, str], str] = {}
+    with open(PROXY_MANIFEST_CSV, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            ticker = row.get("ticker", "").upper()
+            accession = row.get("accession", "").strip()
+            comp_year = row.get("comp_year", "").strip()
+            if ticker and accession and comp_year:
+                years[(ticker, accession)] = comp_year
+    return years
+
+
 # ── Results helpers ───────────────────────────────────────────────────────────
 
 def read_results() -> list[dict]:
@@ -105,7 +130,7 @@ def write_output_csv(tickers: list[str]) -> Path | None:
                 writer.writerow({
                     "ticker":       r.get("ticker", ""),
                     "company_name": r.get("company_name", ""),
-                    "ceo_name":     r.get("ceo_name_8k") or r.get("ceo_name_proxy", ""),
+                    "ceo_name":     _normalize_person_name(r.get("ceo_name_8k") or r.get("ceo_name_proxy", "")),
                     "start_date":   r.get("start_date_8k", ""),
                     "source":       r.get("source", ""),
                     "match_status": r.get("match_status", ""),
@@ -120,7 +145,7 @@ def write_output_csv(tickers: list[str]) -> Path | None:
                 writer.writerow({
                     "ticker":       ticker,
                     "company_name": row.get("Company Name", ""),
-                    "ceo_name":     row.get("CEO", ""),
+                    "ceo_name":     _normalize_person_name(row.get("CEO", "")),
                     "start_date":   row.get("CEO Start Date", ""),
                     "source":       "context",
                     "match_status": "not_run",
@@ -138,65 +163,94 @@ def most_recent_output() -> Path | None:
 # ── Subprocess runner ─────────────────────────────────────────────────────────
 
 def run_cmd(label: str, cmd: list[str]) -> int:
-    """Run a command silently. Prints one status line. Shows output only on failure."""
+    """Run a command and stream its output."""
     print(f"  {label}...", end="", flush=True)
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
         cwd=str(PROXY_DIR),
+        env=env,
     )
-    output = proc.stdout.read()
+    saw_output = False
+    if proc.stdout is not None:
+        for line in proc.stdout:
+            if not saw_output:
+                print()
+                saw_output = True
+            print(line, end="")
     proc.wait()
     if proc.returncode != 0:
-        print(" FAILED")
-        print(output)
+        if saw_output:
+            print(f"  {label}: FAILED")
+        else:
+            print(" FAILED")
     else:
-        print(" done")
+        if saw_output:
+            print(f"  {label}: done")
+        else:
+            print(" done")
     return proc.returncode
 
 
-def new_tickers_in_db(tickers: list[str]) -> list[str]:
-    """Return which of these tickers have no CEO name in the local query cache yet."""
+def tickers_missing_proxy_context(tickers: list[str]) -> list[str]:
+    """Return tickers missing proxy-derived CEO context in the local cache."""
     rows = read_db()
     db_map = {r["Ticker"].upper(): r for r in rows}
-    return [t for t in tickers if not db_map.get(t, {}).get("CEO")]
+    missing = []
+    for ticker in tickers:
+        row = db_map.get(ticker, {})
+        if not row.get("CEO") or not row.get("CEO Start Date"):
+            missing.append(ticker)
+    return missing
 
 
 def run_pipeline(tickers: list[str]) -> None:
-    """Run the full pipeline: CEO dates + compensation for the given tickers."""
+    """Run the intended pipeline: proxy context/comp first, then 8-K date refinement."""
     ticker_arg = ",".join(tickers)
     print()
 
-    # Step 0: always refresh proxy-derived CEO context for the requested tickers.
-    run_cmd("Looking up CEO in proxy", [
+    # Step 0: download recent proxies first so proxy CEO lookup can reuse the
+    # local filing instead of performing a second proxy download.
+    if run_cmd("Downloading proxy filings", [
+        PYTHON, "download.py",
+        "--tickers", ticker_arg,
+    ]) != 0:
+        return
+
+    # Step 1: refresh proxy context every run using the local latest proxy. This
+    # avoids stale bad cache and remains fast because the proxy file is already on disk.
+    if run_cmd("Looking up CEO in proxy", [
         PYTHON, "lookup_proxy_ceo.py",
         "--tickers", ticker_arg,
         "--force",
-    ])
+    ]) != 0:
+        return
 
-    run_cmd("Downloading proxy filings", [
-        PYTHON, "download.py",
+    if run_cmd("Extracting compensation", [
+        PYTHON, "extract.py",
         "--tickers", ticker_arg,
-    ])
+    ]) != 0:
+        return
 
-    run_cmd("Downloading 8-K filings", [
+    # Step 2: use the proxy-derived date as the search hint for the 8-K lookup.
+    if run_cmd("Downloading 8-K filings", [
         PYTHON, "download_8k.py",
         "--tickers", ticker_arg,
         "--context-csv", CONTEXT_CSV,
-    ])
+    ]) != 0:
+        return
 
-    run_cmd("Extracting CEO name and start date", [
+    if run_cmd("Extracting CEO name and start date", [
         PYTHON, "extract_8k.py",
         "--tickers", ticker_arg,
         "--context-csv", CONTEXT_CSV,
-    ])
-
-    run_cmd("Extracting compensation", [
-        PYTHON, "extract.py",
-        "--tickers", ticker_arg,
-    ])
+    ]) != 0:
+        return
 
 
 def run_pipeline_all() -> None:
@@ -226,11 +280,21 @@ def _names_loosely_match(a: str, b: str) -> bool:
     return a in b or b in a or a.split()[-1] == b.split()[-1]
 
 
+def _normalize_person_name(name: str) -> str:
+    value = (name or "").strip()
+    if not value:
+        return ""
+    value = re.sub(r"\s+", " ", value)
+    value = re.sub(r"^(mr|ms|mrs|dr|sir)\.?\s+", "", value, flags=re.I)
+    return value.strip()
+
+
 def print_ticker_results(tickers: list[str]) -> None:
     results   = read_results()
     comp_rows = read_comp_results()
     ticker_set = {t.upper() for t in tickers}
     manifest_companies = read_manifest_companies()
+    manifest_comp_years = read_proxy_manifest_comp_years()
     context_rows = {r["Ticker"].upper(): r for r in read_db()}
     result_rows = {
         r["ticker"].upper(): r
@@ -256,10 +320,11 @@ def print_ticker_results(tickers: list[str]) -> None:
         )
         ceo = (
             result_row.get("ceo_name_8k")
-            or result_row.get("ceo_name_proxy")
             or context_row.get("CEO", "")
+            or result_row.get("ceo_name_proxy")
             or "—"
         )
+        ceo = _normalize_person_name(ceo) or "—"
         date_ = (
             result_row.get("start_date_8k")
             or context_row.get("CEO Start Date", "")
@@ -269,7 +334,18 @@ def print_ticker_results(tickers: list[str]) -> None:
         # Filter comp to the current CEO, deduplicate by year (keep highest total)
         rows_for_ceo = [
             c for c in comp_all.get(ticker, [])
-            if ceo == "—" or _names_loosely_match(ceo, c.get("ceo_name", ""))
+            if (
+                (
+                    not (c.get("ceo_name") or "").strip()
+                    or ceo == "—"
+                    or _names_loosely_match(ceo, c.get("ceo_name", ""))
+                )
+                and (
+                    (ticker, c.get("accession", "").strip()) not in manifest_comp_years
+                    or str(c.get("comp_year", "")).strip()
+                    == manifest_comp_years[(ticker, c.get("accession", "").strip())]
+                )
+            )
         ]
         by_year: dict[str, dict] = {}
         for c in rows_for_ceo:
@@ -462,5 +538,8 @@ if __name__ == "__main__":
     if args.tickers:
         cli_tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     elif args.tickers_positional:
-        cli_tickers = [t.strip().upper() for t in args.tickers_positional if t.strip()]
+        parsed: list[str] = []
+        for raw in args.tickers_positional:
+            parsed.extend([t.strip().upper() for t in raw.split(",") if t.strip()])
+        cli_tickers = parsed
     main(cli_tickers=cli_tickers)
