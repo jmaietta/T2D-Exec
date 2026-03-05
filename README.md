@@ -7,7 +7,8 @@ The intended workflow is one command, end to end.
 ## What It Does
 
 - Reads the latest DEF 14A proxy to identify the current CEO and extract a rough tenure hint.
-- Uses that proxy hint to find the specific 8-K (Item 5.02) that announced the appointment.
+- Uses that proxy hint to find 8-K (Item 5.02) filings in a tight date window around the expected appointment.
+- Also runs a recent Item 5.02 sweep (about 18 months) to detect post-proxy CEO transitions.
 - Extracts the exact CEO start date from the 8-K when available.
 - Falls back to proxy-derived evidence when no exact 8-K date can be confirmed.
 - Downloads recent proxy filings and extracts CEO compensation by year.
@@ -17,14 +18,19 @@ The intended workflow is one command, end to end.
 Interactive menu:
 
 ```bash
-venv/bin/python3 ceorater.py
+.venv/bin/python3 ceorater.py
+# or
+python3 ceorater.py
 ```
 
 One-shot query for one or more tickers:
 
 ```bash
-venv/bin/python3 ceorater.py MSFT
-venv/bin/python3 ceorater.py MSFT ADSK AMD
+.venv/bin/python3 ceorater.py MSFT
+.venv/bin/python3 ceorater.py MSFT ADSK AMD
+# or
+python3 ceorater.py MSFT
+python3 ceorater.py MSFT ADSK AMD
 ```
 
 Example output:
@@ -43,8 +49,8 @@ Example output:
 ## Setup
 
 ```bash
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 cp .env.example .env
 ```
 
@@ -58,11 +64,13 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 - `ceorater.py`: main CLI and pipeline orchestrator
 - `lookup_proxy_ceo.py`: proxy-first CEO discovery
-- `download_8k.py`: 8-K retrieval, including historical fallback search
-- `extract_8k.py`: CEO name and start-date extraction
+- `download_8k.py`: 8-K retrieval (proxy-date window + recent 5.02 sweep + historical fallback)
+- `extract_8k.py`: CEO name and start-date extraction with current-CEO supersession handling
 - `download.py`: proxy download for compensation extraction
 - `extract.py`: compensation extraction
 - `edgar_client.py`: shared SEC EDGAR client
+- `sec_filing_parser.py`: structured SEC filing parser (HTML/XML/iXBRL + optional Arelle path)
+- `env_utils.py`: local `.env` loader helpers
 
 ## Internal State
 
@@ -79,5 +87,16 @@ These are generated artifacts and are ignored by git.
 ## Notes
 
 - SEC access is public but rate-limited.
-- The extraction steps use Anthropic models, so a valid API key is required.
+- Extraction is parser-first (deterministic/iXBRL) with Anthropic-assisted fallback where needed.
+- Some extraction steps use Anthropic models, so a valid API key is required.
 - Exact CEO dates are preferred from 8-K filings; proxy dates are used as fallback evidence when no appointment filing is available.
+- A ticker may return a current-CEO transition outcome when a newer recent 5.02 appointment supersedes the proxy CEO.
+
+## Reprocessing
+
+When logic changes or cached filings already exist, force reprocessing:
+
+```bash
+python3 extract_8k.py --tickers MSFT --force
+python3 ceorater.py MSFT
+```
